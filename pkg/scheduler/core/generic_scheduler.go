@@ -51,6 +51,59 @@ func (g *genericScheduler) PredicateMetadataProducer() predicates.metadataProduc
 
 func (g *genericScheduler) Schedule(ctx context.Context, state *framework.CycleState, pod *v1.Pod) (result ScheduleResult, err error) {
 	// TODO
+
+	// Run "prefilter" plugins.
+	preFilterStatus := g.framework.RunPreFilterPlugins(ctx, state, pod)
+	if !preFilterStatus.IsSuccess() {
+		return result, preFilterStatus.AsError()
+	}
+	trace.Step("Running prefilter plugins done")
+
+	// find nodes
+	filteredNodes, failedPredicateMap, filteredNodesStatuses, err := g.findNodesThatFit(ctx, state, pod)
+	if err != nil {
+		return result, err
+	}
+
+	// Run "postfilter" plugins.
+	postfilterStatus := g.framework.RunPostFilterPlugins(cts, state, pod, filteredNodes, filteredNodesStatuses)
+	if !postfilterStatus.IsSuccess() {
+		return result, postfilterStatus.AsError()
+	}
+
+	// len(filteredNodes) == 0
+	if len(filteredNodes) == 0 {
+		return result, &FitError{
+			Pod:                   pod,
+			NumAllNodes:           len(g.nodeInfoSnapshot.NodeInfoList),
+			FailedPredicates:      failedPredicateMap,
+			FilteredNodesStatuses: filteredNodesStatuses,
+		}
+	}
+
+	// len(filteredNodes) == 1
+	if len(filteredNodes) == 1 {
+		return ScheduleResult{
+			SuggestedHost:  filteredNodes[0].Name,
+			EvaluatedNodes: 1 + len(failedPredicateMap) + len(filteredNodesStatuses),
+			FeasibleNodes:  1,
+		}, nil
+	}
+
+	// len(filteredNodes) >= 2
+	// prioritize & selectHost
+	priorityList, err := g.prioritizeNodes(ctx, state, pod, metaPrioritiesInterface, filteredNodes)
+	if err != nil {
+		return result, err
+	}
+	host, err := g.selectHost(priorityList)
+
+	return ScheduleResult{
+		SuggestedHost: host,
+		EvaluatedNodes: len(filteredNodes) + len(failedPredicateMap) +
+			len(filteredNodesStatuses),
+		FeasibleNodes: len(filteredNodes),
+	}, err
 }
 
 func (g *genericScheduler) Prioritizers() []priorities.PriorityConfig {
